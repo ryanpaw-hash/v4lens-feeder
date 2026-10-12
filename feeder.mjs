@@ -25,15 +25,16 @@ const hex = (n) => "0x" + n.toString(16);
 let id = 0;
 
 let rpcNotes = 0;
+// The first RPC in RPCS is always tried first; the next ones only take over when it fails.
 async function rpc(method, params) {
   let last;
-  for (let round = 0, busy = 0; round < 8; round++) {
-    const url = RPCS[(id + round) % RPCS.length];
+  for (let n = 0; n < 8; n++) {
+    const url = RPCS[n % RPCS.length];
     const host = new URL(url).host;
     try {
       const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: ++id, method, params }), signal: AbortSignal.timeout(45_000) });
       const text = await r.text();
-      // An HTML page or any non-200 is a rate-limit / error page, not an answer: back off and try the other RPC.
+      // An HTML page or any non-200 is a rate-limit / error page, not an answer.
       if (!r.ok || text.trimStart().startsWith("<")) throw new Error(`busy: HTTP ${r.status} ${text.trimStart().startsWith("<") ? "html page" : "error"} from ${host}`);
       const j = JSON.parse(text);
       if (j.error) {
@@ -44,22 +45,20 @@ async function rpc(method, params) {
       return j.result;
     } catch (e) {
       last = e;
-      if (/^busy|429|Too Many/i.test(String(e.message)) && busy < 6) {
-        if (rpcNotes++ < 3) console.error("rpc backoff:", String(e.message).slice(0, 120));
-        busy++; round--; await sleep(Math.min(12_000, 1500 * busy)); continue;
-      }
-      await sleep(600 * (round + 1));
+      if (rpcNotes++ < 3) console.error("rpc backoff:", String(e.message).slice(0, 120));
+      await sleep(Math.min(8_000, 700 * (n + 1)));
     }
   }
   throw last;
 }
 
+let locked = 0;
 async function api(path, init = {}) {
   for (let t = 0; t < 6; t++) {
     try {
       const r = await fetch(SITE + path, { ...init, headers: { ...(init.headers || {}), authorization: `Bearer ${SECRET}`, "content-type": "application/json" }, signal: AbortSignal.timeout(100_000) });
       if (r.ok || r.status === 409) return { status: r.status, body: await r.json().catch(() => ({})) };
-      if (r.status === 423) { await sleep(4000); continue; } // an indexer tick holds the lease
+      if (r.status === 423) { await sleep(3000); t--; if (++locked > 15) throw new Error("lease stayed locked"); continue; } // an indexer tick holds the lease
       if (r.status === 401) throw new Error("401 unauthorized: FEED_SECRET does not match the Worker's ADMIN_SECRET");
       await sleep(2000 * (t + 1));
     } catch (e) {
