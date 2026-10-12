@@ -24,23 +24,30 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const hex = (n) => "0x" + n.toString(16);
 let id = 0;
 
+let rpcNotes = 0;
 async function rpc(method, params) {
   let last;
   for (let round = 0, busy = 0; round < 8; round++) {
     const url = RPCS[(id + round) % RPCS.length];
+    const host = new URL(url).host;
     try {
       const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: ++id, method, params }), signal: AbortSignal.timeout(45_000) });
       const text = await r.text();
-      if (r.status === 429) throw new Error("429 Too Many Requests");
+      // An HTML page or any non-200 is a rate-limit / error page, not an answer: back off and try the other RPC.
+      if (!r.ok || text.trimStart().startsWith("<")) throw new Error(`busy: HTTP ${r.status} ${text.trimStart().startsWith("<") ? "html page" : "error"} from ${host}`);
       const j = JSON.parse(text);
       if (j.error) {
         if (/exceeds limit|are allowed/.test(j.error.message)) return { tooMany: true };
+        if (/busy|rate|limit|too many/i.test(j.error.message)) throw new Error(`busy: ${j.error.message.slice(0, 80)} from ${host}`);
         throw new Error(j.error.message);
       }
       return j.result;
     } catch (e) {
       last = e;
-      if (/429|Too Many|busy/i.test(String(e.message)) && busy < 6) { busy++; round--; await sleep(1500 * busy); continue; }
+      if (/^busy|429|Too Many/i.test(String(e.message)) && busy < 6) {
+        if (rpcNotes++ < 3) console.error("rpc backoff:", String(e.message).slice(0, 120));
+        busy++; round--; await sleep(Math.min(12_000, 1500 * busy)); continue;
+      }
       await sleep(600 * (round + 1));
     }
   }
@@ -94,14 +101,14 @@ while (head - cursor > 600 && left() > 60_000) {
 
 /* ---- 2. X-ray queue ---- */
 let saved = 0, failed = 0;
-while (left() > 45_000) {
+while (left() > 45_000 && !(failed >= 10 && saved === 0)) {
   const q = await api("/api/internal/xray-queue?hours=24&limit=60");
-  const items = q.body.items ?? [];
+  const items = (q.body.items ?? []).slice(0, 30);
   if (!items.length) break;
   const out = [];
   let next = 0;
-  await Promise.all(Array.from({ length: 6 }, async () => {
-    while (next < items.length && left() > 25_000) {
+  await Promise.all(Array.from({ length: 3 }, async () => {
+    while (next < items.length && left() > 25_000 && !(failed >= 10 && out.length === 0)) {
       const l = items[next++];
       try { out.push({ token: l.token, x: await xray(rpc, l, l.quote || "0x0000000000000000000000000000000000000000") }); }
       catch (e) { failed++; if (failed < 4) console.error("xray failed", l.token, String(e).slice(0, 120)); }
